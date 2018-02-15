@@ -1,0 +1,99 @@
+---
+title: "/VX Futures Contango R Notebook"
+author: "Jason Taylor (The Mechanical Bear, LLC)"
+date: "2/15/2018"
+output: pdf_document
+latex_engine: xelatex
+mainfont: Arial 
+geometry: left = 1cm, right = 1cm, top = 1cm, bottom = 1cm
+---
+
+## Setup global options and load libraries
+
+```{r global_options, include = TRUE}
+knitr::opts_chunk$set(message = FALSE, 
+                      tidy.opts = list(width.cutoff = 60)) 
+```
+
+```{r Setup, include = TRUE, results = FALSE}
+suppressWarnings(suppressMessages(suppressPackageStartupMessages({
+  library_list <- c("xml2", "rvest", "stringr", "dplyr", "tidyr", "utils",
+                    "purrr", "lubridate", "stats", "zoo", "knitr", "kableExtra")
+  lapply(library_list, require, character.only = TRUE)
+})))
+```
+## Download the data from CBOE site
+
+```{r Download Data}
+url <- "http://cfe.cboe.com/market-data/historical-data"
+regex_vx <- "CFE_[A-Z]{1}[0-9]{2}_(VX){1}(\\.){1}(csv){1}" # REGEX for VX files on site
+page <- xml2::read_html(url)
+
+file_paths <- page %>%
+  rvest::html_nodes("a") %>%       # find all links
+  rvest::html_attr("href") %>%     # get the url
+  stringr::str_subset("\\.csv")    # all csv files
+  
+file_paths <- as.data.frame(file_paths) %>%
+  dplyr::mutate(web_url = "http://cfe.cboe.com",
+                link = paste0(web_url, file_paths)) %>%
+  tidyr::separate(file_paths, into = c("blank", "Publish", "ScheduledTask", "MktData", 
+                                       "datahouse", "file_name"), sep = "/") %>%
+  dplyr::select(file_name, link) %>%
+  dplyr::filter(grepl(regex_vx, link))
+
+mapply(utils::download.file, url = file_paths$link, destfile = file_paths$file_name)
+```
+
+## Data Processing
+
+* Bind files
+
+* Split contract name into year, month, contract symbol
+
+* Calculate contango as % of front month - back month / front month settle
+
+* Add front month and back month as new columns for clarity and future use in analysis
+
+```{r Processing}
+vx_files = as.data.frame(list.files(pattern = regex_vx), stringsAsFactors = FALSE) %>%
+  stats::setNames(., "file_name")
+
+vx_data <- purrr::map_df(vx_files$file_name, utils::read.table, blank.lines.skip = TRUE, fill = TRUE,
+                         header = FALSE, quote = '', sep = ",", stringsAsFactors = FALSE) %>%
+  dplyr::select(1:11) %>% 
+  stats::setNames(., c("quote_date", "contract", "open", "high", "low", "close", "settle",
+                       "change", "volume", "efp", "open_interest")) %>%
+  dplyr::filter(!grepl("Trade", quote_date),
+                !grepl("CFE", quote_date)) %>%
+  dplyr::mutate(quote_date = as.Date(quote_date, format = "%m/%d/%Y"),
+                contract = gsub("\\(", "", contract),
+                contract = gsub("\\)", "", contract)) %>%
+  tidyr::separate(contract, c("contract", "month", "year"), sep = " ") %>%
+  dplyr::mutate(month = zoo::as.yearmon(month, "%b"),
+                month = lubridate::month(month),
+                year = paste0("20", year)) %>%
+  dplyr::mutate_at(vars(4:13), funs(as.numeric)) %>%
+  dplyr::group_by(quote_date) %>%
+  dplyr::arrange(year, month) %>%
+  dplyr::mutate(contango = c(NA, diff(settle)),
+                diff_month = dplyr::lead(contango, 1),
+                diff_front_back = dplyr::nth(diff_month, 1),
+                contango_perc = 100 * (diff_front_back / dplyr::first(settle)),
+                front_month = dplyr::nth(settle, 1),
+                back_month = dplyr::nth(settle, 2)) %>%
+  dplyr::ungroup()
+```
+
+## Printing recent dates to show data most important variables and structure
+
+```{r print tail}
+knitr::kable(tail(vx_data[ , c(1, 2, 4, 17:19)]))
+```
+
+## Save Results
+
+```{r Save}
+saveRDS(vx_data, file = paste0("vx_data_", Sys.Date(), ".RDS"))
+```
+
